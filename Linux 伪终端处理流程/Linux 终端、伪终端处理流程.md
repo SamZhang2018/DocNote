@@ -5,11 +5,11 @@
 
 # 本地伪终端的处理流程
 键盘输入的中断编号1：
-![[Pasted image 20260610002930.png]]
+![alt text](./image/irq_num.png)
 
 以内核4.0的源码作为参考基准，键盘输入后的数据传递流程：
+![alt text](./image/irq_proc.png)
 
-![[Pasted image 20260610151004.png]]
 1. 通常keyboard 键盘注册的中断编号为1. 
 2. 中断的下半区为 tty_buffer的 workqueue 处理。回调入口为 flush_to_ldisc
 3. 传递外设字符，传递到 tty_ldisc_ops 的处理回调指针 n_tty_receive_buf2
@@ -18,17 +18,18 @@
 - 若 tty 终端的回显标志ECHO为true，通过 echo_char 回写到显示器上。并对某些字符进行转义处理。
 
 shell 进程读取键盘输入的流程： 
-![[Pasted image 20260610153436.png]]
+![alt text](./image/shell_read.png)
 
 这里关键的地方在 结构体 struct file_operations tty_fops 中，其作为 pty 字符设备的默认文件操作指针。
 
 整个的空间结构，从用户态到内核态涉及的关键对象（节点）：
-![[Pasted image 20260610153755.png]]
+![alt text](./image/struct_space.png)
 
 # SSH 方式的伪终端处理流程
 
 框架示意图，表示从远端的终端模拟软件，比如xshell等：
-![[Pasted image 20260610154646.png]]
+![alt text](./image/ssh_space.png)
+
 其流的处理，与本地中断的处理方式不同，一个是本地的keyboard 和 终端，一个是网络的keyboard 和 终端。
 
 # 终端与会话进程
@@ -37,7 +38,7 @@ shell 进程读取键盘输入的流程：
 在会话进程组（Session）中，又区分前台进程和后台进程。可以在内核 task_struct 结构体中找到对应的成员（可以参考 setsid的系统调用）。
 同时在 struct tty_struct 结构体中，有相关会话进程的 struct pid *session 信息。
 
-![[Pasted image 20260610161612.png]]
+![alt text](./image/terminal_session.png)
 
 # 终端属性
 在《Unix系统编程手册》中，第62章有终端的介绍。这里只介绍上面章节提到的**回显标志 ECHO**.
