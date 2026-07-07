@@ -1,0 +1,34 @@
+当前网络上缺乏通用性容器逃逸检测工具。现有的检测理论 MITRE ATT&CK 以及网络攻击连理论，其在工具落地层面，缺乏有效的指导。网络上的开源检测工具，缺乏通用性，比如基于规则的检测工具，类似falco、tetragon等，而且缺乏专业性，比如基于软件行为特征的分析，类似基于系统日志进行特征分析。
+
+因此，本文提出一个通用性、且专业性的容器逃逸检测方案。
+它的理论层面，以信息流理论为基础 Information flow theory，以 ebpf 技术作为落地手段，设置管控的信息流管道作为检测逻辑。
+它的工程层面，参考PACED论文、sysflow以及camflow的设计思想，以linux系统作为TCB （trusted computer base 可信计算基础）。
+容器的本质是一个linux进程，其受linux底层提供的命名空间、cgroup机制约束。
+基于以上逻辑，以跨命名空间、cgroup机制的进程间通信，作为检测的基准逻辑。结合跨进程通信的行为特征，将行为特征作为白名单，非白名单以外的跨容器信息流，则认为是逃逸行为。
+
+UNIX/Linux 进程间通信（IPC）与同步工具全景分类表（含调用示例）
+
+|一级分类 (Type)|二级分类 (Sub-Type)|名称 (Name)|通信机理/交互机制 (How It Communicates)|相关核心系统调用|**调用示例 / 触发行为 (Usage Examples)**|
+|---|---|---|---|---|---|
+|**通信**  <br>_(Communication)_|**字节流**  <br>_(Byte Stream)_|匿名管道 (Pipe)|**内核缓冲区中转**：内核在内存中维护一个环形缓冲区。源进程向代表写端的 FD 写入字节流，内核将其复制到缓冲区；目标进程从读端 FD 读取。|`pipe`, `pipe2`|`int fd[2]; pipe(fd);`  <br>`write(fd[1], buf, len);`|
+|||命名管道 (FIFO)|**文件系统索引+内核缓冲区**：通过 VFS 中的 FIFO 特殊文件节点（Inode）作为纽带。两个无亲缘关系的进程通过路径打开该文件后，通信机制与匿名管道一致。|`mkfifo`, `mknod`, `open`|`mkfifo("/tmp/my_fifo", 0666);`  <br>`int fd = open("/tmp/my_fifo", O_WRONLY);`|
+|||流套接字 (Stream Socket)|**双向内核协议栈/队列**：基于内核套接字缓冲区（sk_buff）。UNIX Domain Socket 在内核中直接拷贝内存数据包；TCP/IP Socket 则通过完整的网络协议栈进行可靠传输。|`socket`, `bind`, `connect`, `listen`, `accept`, `sendmsg`, `recvmsg`|`int s = socket(AF_UNIX, SOCK_STREAM, 0);`  <br>`connect(s, &addr_of_host_dockerd, len);` _(逃逸高发项)_|
+||**伪终端**  <br>_(Terminal)_|伪终端 (Pseudo-Terminal)|**主/从设备驱动中转**：通过内核的 pty 驱动程序。写入主端（Master）的数据会被驱动程序自动重定向，变为从端（Slave，通常是 shell）的输入。|`posix_openpt`, `grantpt`, `unlockpt`|`int master_fd = posix_openpt(O_RDWR);`  <br>`char *slave_name = ptsname(master_fd);`|
+||**消息**  <br>_(Message)_|System V 消息队列|**内核链表+消息标签**：内核空间维护一个全局的消息链表。源进程向内核链表存入带有特定“类型标签”的数据块；目标进程通过请求特定类型的标签取出消息。|`msgget`, `msgsnd`, `msgrcv`, `msgctl`|`int mqid = msgget(key, IPC_CREAT\|0666);`  <br>`struct msgbuf m = {1, "data"}; msgsnd(mqid, &m, 4, 0);`|
+|||POSIX 消息队列|**虚拟文件系统+优先级队列**：在内核中基于 `mqueue` 虚拟文件系统实现。数据以结构化消息形式存放在内核的优先级队列中，目标进程可以按优先级高低进行读取。|`mq_open`, `mq_send`, `mq_receive`, `mq_notify`, `mq_unlink`|`mqd_t mq = mq_open("/my_mq", O_WRONLY);`  <br>`mq_send(mq, "msg", 3, priority_level);`|
+|||数据报套接字 (Datagram Socket)|**无连接对等数据包拷贝**：类似于流套接字，但在内核中不维护连接状态。数据被打包成有固定边界的独立数据报，通过目标地址直接投递到对端的接收缓冲区。|`socket`, `sendto`, `recvfrom`|`int s = socket(AF_INET, SOCK_DGRAM, 0);`  <br>`sendto(s, buf, len, 0, &dest_addr, addr_len);`|
+||**共享内存**  <br>_(Shared Memory)_|System V 共享内存|**物理页表直接映射（零拷贝）**：通过内核将同一块物理内存页同时关联（Attach）到不同进程的虚拟地址空间。一端写内存，另一端立刻可见。|`shmget`, `shmat`, `shmdt`, `shmctl`|`int shmid = shmget(key, 4096, IPC_CREAT\|0666);`  <br>`char *ptr = (char *)shmat(shmid, NULL, 0);` _(逃逸前移拦截点)_|
+|||POSIX 共享内存|**tmpfs 内存文件映射**：基于内核 `/dev/shm` 虚拟文件系统。进程通过 `shm_open` 获取 FD，再通过 `mmap` 将该内存文件映射到各自的地址空间。|`shm_open`, `shm_unlink`|`int fd = shm_open("/my_shm", O_RDWR, 0666);`  <br>`void *addr = mmap(NULL, 4096, PROT_WRITE, MAP_SHARED, fd, 0);`|
+|||内存映射-匿名映射|**页表继承/父子共享**：在 `mmap` 时不关联任何文件且指定 `MAP_SHARED`。多用于有亲缘关系的进程，子进程通过 `fork` 继承父进程的页表结构以共享内存。|`mmap`, `munmap`|`void *addr = mmap(NULL, 4096, PROT_READ\|PROT_WRITE, MAP_SHARED\|MAP_ANONYMOUS, -1, 0);`|
+|||内存映射-映射文件|**页缓存（Page Cache）共享**：两个进程同时通过 `mmap` 映射磁盘上的同一个文件。内核将文件的页缓存映射到进程虚拟空间，一端修改内存即修改了页缓存。|`mmap`, `munmap`, `msync`|`int fd = open("/etc/crontab", O_RDWR);`  <br>`void *addr = mmap(NULL, 4096, PROT_WRITE, MAP_SHARED, fd, 0);` _(敏感路径)_|
+||**内存直接访问**  <br>_(Direct Access)_|跨进程内存控制 (CMA)|**内核越权跨进程页表复制**：拥有高特权的源进程直接向内核提供目标进程的 PID 和目标虚拟内存地址，内核在内部穿透隔离，直接执行数据复制。|`process_vm_readv`, `process_vm_writev`|`struct iovec local[1], remote[1];`  <br>`process_vm_writev(target_host_pid, local, 1, remote, 1, 0);` _(高危注入)_|
+|**信号**  <br>_(Signal)_|**信号机制**  <br>_(Signal)_|标准信号 (Standard Signal)|**内核异步任务标记（软中断）**：源进程发起请求，内核修改目标进程 `task_struct` 中的信号位图。目标进程返回用户态时强制执行对应的信号处理函数。|`kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`|`kill(target_host_pid, SIGKILL);`  <br>`tgkill(tgid, tid, SIGSTOP);` _(跨容器强制控制外部进程)_|
+|||实时信号 (Real-time Signal)|**内核信号队列携带数据**：与标准信号类似，但内核在内部为目标进程维护一个排队队列（不丢失），投递时可通过 `sigval` 携带一个整数或指针。|`rt_sigaction`, `rt_sigprocmask`, `rt_sigtimedwait`|`union sigval val; val.sival_int = 1234;`  <br>`sigqueue(target_host_pid, SIGRTMIN, val);`|
+|**同步**  <br>_(Synchronization)_|**信号量**  <br>_(Semaphore)_|System V 信号量|**内核原子计数器操作**：内核空间维护一个全局的信号量数值。进程通过原子操作（PV 操作）修改该数值，若数值小于零，内核将当前进程挂起放入等待队列。|`semget`, `semop`, `semctl`|`int semid = semget(key, 1, IPC_CREAT\|0666);`  <br>`struct sembuf sb = {0, -1, SEM_UNDO}; semop(semid, &sb, 1);`|
+|||POSIX 命名信号量|**基于 VFS 的全局计数器**：在内核中依托特定的文件路径创建同步对象。进程通过路径名称关联到同一个内核计数器上，通过原子增减进行同步。|`sem_open`, `sem_wait`, `sem_post`, `sem_close`, `sem_unlink`|`sem_t *sem = sem_open("/my_sem", O_CREAT, 0666, 1);`  <br>`sem_wait(sem);`|
+|||POSIX 无名信号量|**共享内存内的线程/进程计数器**：信号量结构体直接存放在进程间共享的内存区中。同步直接在用户态通过 CPU 原子指令（如 CAS）修改该内存值。|`sem_init`, `sem_destroy`, `sem_wait`, `sem_post`|`sem_init(&shared_sem_in_shm, 1, 1);`  <br>`sem_wait(&shared_sem_in_shm);`|
+||**文件锁**  <br>_(File Lock)_|“记录”锁 (fcntl)|**VFS Inode 锁链表控制**：锁状态挂载在内核的 `inode->i_flctx` 链表上。当进程试图读写文件的某段字节时，内核检查该链表，若存在冲突则阻塞进程。|`fcntl`|`struct flock fl = {F_WRLCK, SEEK_SET, 0, 100, 0};`  <br>`fcntl(fd, F_SETLK, &fl);`|
+|||文件锁 (flock)|**VFS File 对象锁控制**：锁状态绑定在内核的 `struct file` 上。内核通过该对象上的锁标记，在多个尝试打开并访问该文件的进程间提供同步信号。|`flock`|`int fd = open("/var/run/lockfile", O_RDONLY);`  <br>`flock(fd, LOCK_EX);`|
+||**线程同步锁**  <br>_(Thread Lock)_|互斥量 / 条件变量|**用户态原子变量（无冲突时不入内核）**：锁状态存储在用户态内存中。多线程通过 CPU 原子指令竞争该锁。当发生冲突时，底层通过系统调用将线程挂起。|用户态函数底层触发 `futex`|`pthread_mutex_lock(&mutex);`  <br>`pthread_cond_wait(&cond, &mutex);`|
+|||快速用户空间互斥体 (Futex)|**用户态指针+内核等待队列**：进程在用户态通过原子操作测试锁变量，若无冲突则直接获取；若有冲突，则将该用户态内存地址传给内核进行队列挂起。|`futex`|`syscall(SYS_futex, &futex_val, FUTEX_WAIT, 1, NULL, NULL, 0);`|
+
